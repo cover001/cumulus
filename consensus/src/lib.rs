@@ -31,7 +31,7 @@ use polkadot_primitives::v1::{
 };
 
 use codec::Decode;
-use futures::{future, Future, FutureExt, Stream, StreamExt};
+use futures::{future, Future, FutureExt, Stream, StreamExt, select};
 use log::{error, trace, warn};
 
 use std::{marker::PhantomData, sync::Arc};
@@ -99,11 +99,20 @@ where
 	}
 }
 
-/// Spawns a future that follows the Polkadot relay chain for the given parachain.
-pub fn follow_polkadot<L, P, Block, B>(
+/// Run the parachain consensus.
+///
+/// This will follow the given `relay_chain` to act as consesus for the parachain that corresponds
+/// to the given `para_id`. It will set the new best block of the parachain as it gets aware of it.
+/// The same happens for the finalized block.
+///
+/// # Note
+///
+/// This will access the backend of the parachain and thus, this future should be spawned as blocking
+/// task.
+pub async fn run_parachain_consensus<L, P, Block, B>(
 	para_id: ParaId,
-	local: Arc<L>,
-	polkadot: P,
+	parachain: Arc<L>,
+	relay_chain: P,
 	announce_block: Arc<dyn Fn(Block::Hash, Vec<u8>) + Send + Sync>,
 ) -> ClientResult<impl Future<Output = ()> + Send + Unpin>
 where
@@ -114,9 +123,9 @@ where
 	B: Backend<Block>,
 {
 	let follow_finalized = {
-		let local = local.clone();
+		let parachain = parachain.clone();
 
-		polkadot
+		relay_chain
 			.finalized_heads(para_id)?
 			.filter_map(|head_data| {
 				let res = match <<Block as BlockT>::Header>::decode(&mut &head_data[..]) {
@@ -134,7 +143,7 @@ where
 				future::ready(res)
 			})
 			.for_each(move |p_head| {
-				if let Err(e) = finalize_block(&*local, p_head.hash()) {
+				if let Err(e) = finalize_block(&*parachain, p_head.hash()) {
 					warn!(
 						target: "cumulus-consensus",
 						"Failed to finalize block: {:?}",
@@ -148,18 +157,18 @@ where
 
 	Ok(future::select(
 		follow_finalized,
-		follow_new_best(para_id, local, polkadot, announce_block)?,
+		follow_new_best(para_id, parachain, relay_chain, announce_block)?,
 	)
 	.map(|_| ()))
 }
 
 /// Follow the relay chain new best head, to update the Parachain new best head.
-fn follow_new_best<L, P, Block, B>(
+async fn follow_new_best<L, P, Block, B>(
 	para_id: ParaId,
-	local: Arc<L>,
-	polkadot: P,
+	parachain: Arc<L>,
+	relay_chain: P,
 	announce_block: Arc<dyn Fn(Block::Hash, Vec<u8>) + Send + Sync>,
-) -> ClientResult<impl Future<Output = ()> + Send + Unpin>
+) -> ClientResult<()>
 where
 	Block: BlockT,
 	L: Finalizer<Block, B> + UsageProvider<Block> + Send + Sync + BlockBackend<Block>,
@@ -167,73 +176,70 @@ where
 	P: PolkadotClient,
 	B: Backend<Block>,
 {
-	Ok(polkadot
-		.new_best_heads(para_id)?
-		.filter_map(|head_data| {
-			let res = match <<Block as BlockT>::Header>::decode(&mut &head_data[..]) {
-				Ok(header) => Some(header),
-				Err(err) => {
-					warn!(
-						target: "cumulus-consensus",
-						"Could not decode Parachain header: {:?}", err);
-					None
-				}
-			};
+	let new_best_heads = relay_chain.new_best_heads(para_id)?;
 
-			future::ready(res)
-		})
-		.for_each(move |h| {
-			let hash = h.hash();
+	loop {
+		let parachain_head_data = new_best_heads.next().await;
 
-			if local.usage_info().chain.best_hash == hash {
-				trace!(
+		let parachain_head = match <<Block as BlockT>::Header>::decode(&mut &head_data[..]) {
+			Ok(header) => Some(header),
+			Err(err) => {
+				warn!(
 					target: "cumulus-consensus",
-					"Skipping set new best block, because block `{}` is already the best.",
-					hash,
-				)
-			} else {
-				// Make sure the block is already known or otherwise we skip setting new best.
-				match local.block_status(&BlockId::Hash(hash)) {
-					Ok(BlockStatus::InChainWithState) => {
-						// Make it the new best block
-						let mut block_import_params =
-							BlockImportParams::new(BlockOrigin::ConsensusBroadcast, h);
-						block_import_params.fork_choice = Some(ForkChoiceStrategy::Custom(true));
-						block_import_params.import_existing = true;
-
-						if let Err(err) =
-							(&*local).import_block(block_import_params, Default::default())
-						{
-							warn!(
-								target: "cumulus-consensus",
-								"Failed to set new best block `{}` with error: {:?}",
-								hash, err
-							);
-						}
-
-						(*announce_block)(hash, Vec::new());
-					}
-					Ok(BlockStatus::InChainPruned) => {
-						error!(
-							target: "cumulus-collator",
-							"Trying to set pruned block `{:?}` as new best!",
-							hash,
-						);
-					}
-					Err(e) => {
-						error!(
-							target: "cumulus-collator",
-							"Failed to get block status of block `{:?}`: {:?}",
-							hash,
-							e,
-						);
-					}
-					_ => {}
-				}
+					"Could not decode Parachain header: {:?}", err);
+				continue;
 			}
+		};
 
-			future::ready(())
-		}))
+		let hash = h.hash();
+
+		if parachain.usage_info().chain.best_hash == hash {
+			trace!(
+				target: "cumulus-consensus",
+				"Skipping set new best block, because block `{}` is already the best.",
+				hash,
+			)
+		} else {
+			// Make sure the block is already known or otherwise we skip setting new best.
+			match parachain.block_status(&BlockId::Hash(hash)) {
+				Ok(BlockStatus::InChainWithState) => {
+					// Make it the new best block
+					let mut block_import_params =
+						BlockImportParams::new(BlockOrigin::ConsensusBroadcast, h);
+					block_import_params.fork_choice = Some(ForkChoiceStrategy::Custom(true));
+					block_import_params.import_existing = true;
+
+					if let Err(err) =
+						(&*parachain).import_block(block_import_params, Default::default())
+					{
+						warn!(
+							target: "cumulus-consensus",
+							"Failed to set new best block `{}` with error: {:?}",
+							hash, err
+						);
+					}
+
+					(*announce_block)(hash, Vec::new());
+				}
+				Ok(BlockStatus::InChainPruned) => {
+					error!(
+						target: "cumulus-collator",
+						"Trying to set pruned block `{:?}` as new best!",
+						hash,
+					);
+				}
+				Err(e) => {
+					error!(
+						target: "cumulus-collator",
+						"Failed to get block status of block `{:?}`: {:?}",
+						hash,
+						e,
+					);
+				}
+				_ => {}
+			}
+		}
+	}
 }
 
 impl<T> PolkadotClient for Arc<T>
